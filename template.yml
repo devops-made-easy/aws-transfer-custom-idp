@@ -1,0 +1,386 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: A basic template for creating a Lambda-backed API Gateway for use as
+  a custom identity provider in AWS Transfer. It authenticates against an
+  entry in AWS Secrets Manager of the format server-id/username. Additionaly, the secret
+  must hold the key-value pairs for all user properties returned to AWS Transfer.
+  If you choose to also launch the AWS Transfer endpoint it will be provisioned with the SFTP protocol.
+  This can be changed after launch. Note that FTP is only supported on VPC endpoints
+  You can modify the Lambda function code to do something different after deployment.
+Parameters:
+  CreateServer:
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Type: String
+    Description: Whether this stack creates an AWS Transfer endpoint or not. If the endpoint is created as
+      part of the stack, the custom identity provider is automatically associated with it.
+    Default: 'true'
+  SecretsManagerRegion:
+    Type: String
+    Description: (Optional) The region the secrets are stored in. If this value is not provided, the
+      region this stack is deployed in will be used. Use this field if you are deploying this stack in
+      a region where SecretsMangager is not available.
+    Default: ''
+  TransferEndpointType:
+    AllowedValues:
+      - 'PUBLIC'
+      - 'VPC'
+    Type: String
+    Default: 'PUBLIC'
+    Description: Select PUBLIC if you want a public facing AWS Transfer endpoint or VPC if you want a VPC
+      based endpoint. Note that only SFTP and FTPS are supported on public endpoints.
+  TransferSubnetIDs:
+    Type: String
+    Default: ''
+    Description: Required if launching a VPC endpoint. Comma-seperated list of subnets that you would like
+      the AWS Transfer endpoint to be provisioned into.
+  TransferVPCID:
+    Type: String
+    Default: ''
+    Description: Required if launching a VPC endpoint. The VPC ID that you would like the AWS Transfer endpoint
+      to be provisioned into.
+Conditions:
+  CreateServer:
+    Fn::Equals:
+      - Ref: CreateServer
+      - 'true'
+  NotCreateServer:
+    Fn::Not:
+      - Condition: CreateServer
+  SecretsManagerRegionProvided:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: SecretsManagerRegion
+          - ''
+  TransferVPCEndpoint:
+    Fn::Equals:
+      - Ref: TransferEndpointType
+      - 'VPC'
+Outputs:
+  ServerId:
+    Value:
+      Fn::GetAtt: TransferServer.ServerId
+    Condition: CreateServer
+  StackArn:
+    Value:
+      Ref: AWS::StackId
+  TransferIdentityProviderUrl:
+    Description: URL to pass to AWS Transfer CreateServer call as part of optional IdentityProviderDetails
+    Value:
+      Fn::Join:
+      - ''
+      - - https://
+        - Ref: CustomIdentityProviderApi
+        - .execute-api.
+        - Ref: AWS::Region
+        - .amazonaws.com/
+        - Ref: ApiStage
+    Condition: NotCreateServer
+  TransferIdentityProviderInvocationRole:
+    Description: IAM Role to pass to AWS Transfer CreateServer call as part of optional IdentityProviderDetails
+    Value:
+      Fn::GetAtt: TransferIdentityProviderRole.Arn
+    Condition: NotCreateServer
+Resources:
+  TransferServer:
+    Type: AWS::Transfer::Server
+    Condition: CreateServer
+    Properties:
+      EndpointType:
+        Ref: TransferEndpointType
+      EndpointDetails:
+        Fn::If:
+          - TransferVPCEndpoint
+          - SubnetIds:
+              Fn::Split: [',', Ref: TransferSubnetIDs]
+            VpcId:
+              Ref: TransferVPCID
+          - Ref: AWS::NoValue
+      IdentityProviderDetails:
+        InvocationRole:
+          Fn::GetAtt: TransferIdentityProviderRole.Arn
+        Url:
+          Fn::Join:
+            - ''
+            - - https://
+              - Ref: CustomIdentityProviderApi
+              - .execute-api.
+              - Ref: AWS::Region
+              - .amazonaws.com/
+              - Ref: ApiStage
+      IdentityProviderType: API_GATEWAY
+      LoggingRole:
+        Fn::GetAtt: TransferCWLoggingRole.Arn
+  TransferCWLoggingRole:
+    Description: IAM role used by Transfer to log API requests to CloudWatch
+    Type: AWS::IAM::Role
+    Condition: CreateServer
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - transfer.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/service-role/AWSTransferLoggingAccess
+  CustomIdentityProviderApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: Transfer Family Secrets Manager Integration API
+      Description: API used for Transfer Family to access user information in Secrets Manager
+      FailOnWarnings: true
+      EndpointConfiguration:
+        Types:
+        - REGIONAL
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: LambdaSecretsPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - secretsmanager:GetSecretValue
+            Resource:
+              Fn::Sub:
+                - arn:${AWS::Partition}:secretsmanager:${SecretsRegion}:${AWS::AccountId}:secret:s-*
+                - SecretsRegion:
+                    Fn::If:
+                      - SecretsManagerRegionProvided
+                      - Ref: SecretsManagerRegion
+                      - Ref: AWS::Region
+  ApiCloudWatchLogsRole:
+    Description: IAM role used by API Gateway to log API requests to CloudWatch
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - apigateway.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: ApiGatewayLogsPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:DescribeLogGroups
+            - logs:DescribeLogStreams
+            - logs:PutLogEvents
+            - logs:GetLogEvents
+            - logs:FilterLogEvents
+            Resource: "*"
+  ApiLoggingAccount:
+    Type: AWS::ApiGateway::Account
+    DependsOn:
+    - CustomIdentityProviderApi
+    Properties:
+      CloudWatchRoleArn:
+        Fn::GetAtt: ApiCloudWatchLogsRole.Arn
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId:
+        Ref: ApiDeployment202008
+      MethodSettings:
+      - DataTraceEnabled: false
+        HttpMethod: "*"
+        LoggingLevel: INFO
+        ResourcePath: "/*"
+      RestApiId:
+        Ref: CustomIdentityProviderApi
+      StageName: prod
+  ApiDeployment202008:
+    DependsOn:
+    - GetUserConfigRequest
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId:
+        Ref: CustomIdentityProviderApi
+  TransferIdentityProviderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: transfer.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: TransferCanInvokeThisApi
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - execute-api:Invoke
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${CustomIdentityProviderApi}/prod/GET/*
+      - PolicyName: TransferCanReadThisApi
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - apigateway:GET
+            Resource: "*"
+  GetUserConfigLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Description: A function to lookup and return user data from AWS Secrets Manager.
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt: LambdaExecutionRole.Arn
+      Runtime: python3.7
+      Environment:
+        Variables:
+          SecretsManagerRegion:
+            Fn::If:
+              - SecretsManagerRegionProvided
+              - Ref: SecretsManagerRegion
+              - Ref: AWS::Region
+  GetUserConfigLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName:
+        Fn::GetAtt: GetUserConfigLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn:
+        Fn::Sub: arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${CustomIdentityProviderApi}/*
+  ServersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId:
+        Ref: CustomIdentityProviderApi
+      ParentId:
+        Fn::GetAtt:
+        - CustomIdentityProviderApi
+        - RootResourceId
+      PathPart: servers
+  ServerIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId:
+        Ref: CustomIdentityProviderApi
+      ParentId:
+        Ref: ServersResource
+      PathPart: "{serverId}"
+  UsersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId:
+        Ref: CustomIdentityProviderApi
+      ParentId:
+        Ref: ServerIdResource
+      PathPart: users
+  UserNameResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId:
+        Ref: CustomIdentityProviderApi
+      ParentId:
+        Ref: UsersResource
+      PathPart: "{username}"
+  GetUserConfigResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId:
+        Ref: CustomIdentityProviderApi
+      ParentId:
+        Ref: UserNameResource
+      PathPart: config
+  GetUserConfigRequest:
+    Type: AWS::ApiGateway::Method
+    DependsOn: GetUserConfigResponseModel
+    Properties:
+      AuthorizationType: AWS_IAM
+      HttpMethod: GET
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri:
+          Fn::Join:
+            - ""
+            - - "arn:"
+              - Ref: AWS::Partition
+              - ":apigateway:"
+              - Ref: AWS::Region
+              - ":lambda:path/2015-03-31/functions/"
+              - Fn::GetAtt:
+                - GetUserConfigLambda
+                - Arn
+              - "/invocations"
+        IntegrationResponses:
+        - StatusCode: 200
+        RequestTemplates:
+          application/json: |
+            {
+              "username": "$util.urlDecode($input.params('username'))",
+              "password": "$util.escapeJavaScript($input.params('Password')).replaceAll("\\'","'")",
+              "protocol": "$input.params('protocol')",
+              "serverId": "$input.params('serverId')",
+              "sourceIp": "$input.params('sourceIp')"
+            }
+      RequestParameters:
+        method.request.header.Password: false
+      ResourceId:
+        Ref: GetUserConfigResource
+      RestApiId:
+        Ref: CustomIdentityProviderApi
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: UserConfigResponseModel
+  GetUserConfigResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId:
+        Ref: CustomIdentityProviderApi
+      ContentType: application/json
+      Description: API response for GetUserConfig
+      Name: UserConfigResponseModel
+      Schema:
+        "$schema": http://json-schema.org/draft-04/schema#
+        title: UserUserConfig
+        type: object
+        properties:
+          HomeDirectory:
+            type: string
+          Role:
+            type: string
+          Policy:
+            type: string
+          PublicKeys:
+            type: array
+            items:
+              type: string
